@@ -5,7 +5,9 @@ import json
 import os
 import queue
 import shutil
+import subprocess
 import sys
+import tempfile
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,7 +15,6 @@ from typing import Optional
 
 import mss
 import pyperclip
-import pytesseract
 import tkinter as tk
 from PIL import Image, ImageEnhance, ImageFilter, ImageTk
 from pynput import keyboard
@@ -32,12 +33,11 @@ DEFAULT_CONFIG = {
     "contrast": 1.4,
     "sharpen": True,
 }
+MIN_TRAINEDDATA_BYTES = 100_000
 
 
 def app_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent
+    return Path(sys.executable if getattr(sys, "frozen", False) else __file__).resolve().parent
 
 
 CONFIG_PATH = app_dir() / "config.json"
@@ -63,57 +63,128 @@ def load_config() -> dict:
             if isinstance(value, dict):
                 config.update(value)
         except Exception as exc:
-            print(f"[WARN] config.json을 읽지 못했습니다: {exc}")
+            print(f"[WARN] config.json 읽기 실패: {exc}")
     else:
-        CONFIG_PATH.write_text(
-            json.dumps(DEFAULT_CONFIG, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        CONFIG_PATH.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
     return config
 
 
-def find_tesseract() -> Optional[str]:
+def find_tesseract() -> Optional[Path]:
     found = shutil.which("tesseract")
     if found:
-        return found
-
+        return Path(found).resolve()
     if os.name != "nt":
         return None
-
-    program_files = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
-    local_app_data = Path(os.environ.get("LOCALAPPDATA", ""))
-    candidates = [
-        program_files / "Tesseract-OCR" / "tesseract.exe",
-        local_app_data / "Programs" / "Tesseract-OCR" / "tesseract.exe",
-        local_app_data / "Microsoft" / "WinGet" / "Links" / "tesseract.exe",
-        program_files / "WinGet" / "Links" / "tesseract.exe",
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            return str(candidate)
+    pf = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+    la = Path(os.environ.get("LOCALAPPDATA", ""))
+    for path in (
+        pf / "Tesseract-OCR" / "tesseract.exe",
+        la / "Programs" / "Tesseract-OCR" / "tesseract.exe",
+        la / "Microsoft" / "WinGet" / "Links" / "tesseract.exe",
+        pf / "WinGet" / "Links" / "tesseract.exe",
+    ):
+        if path.exists():
+            return path.resolve()
     return None
 
 
-def configure_tesseract() -> None:
+def win_subprocess_options() -> dict:
+    return {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)} if os.name == "nt" else {}
+
+
+@dataclass(frozen=True)
+class TesseractRuntime:
+    executable: Path
+    tessdata_dir: Path
+    languages: frozenset[str]
+
+
+def check_traineddata(path: Path) -> None:
+    if not path.is_file():
+        raise RuntimeError(f"OCR 언어 파일이 없습니다: {path}")
+    size = path.stat().st_size
+    if size < MIN_TRAINEDDATA_BYTES:
+        raise RuntimeError(f"OCR 언어 파일이 비정상적으로 작습니다: {path} ({size:,} bytes)")
+    head = path.read_bytes()[:64].lower()
+    if b"<html" in head or b"<!doctype" in head:
+        raise RuntimeError(f"traineddata 대신 HTML이 저장되었습니다: {path}")
+    print(f"[OK] {path.name}: {size:,} bytes")
+
+
+def configure_tesseract(required_languages: list[str]) -> TesseractRuntime:
     executable = find_tesseract()
     if not executable:
+        raise RuntimeError("Tesseract OCR을 찾을 수 없습니다. run.bat을 실행해 주세요.")
+
+    tessdata_dir = (app_dir() / "tessdata").resolve()
+    if not tessdata_dir.is_dir():
+        raise RuntimeError(f"tessdata 폴더가 없습니다: {tessdata_dir}")
+    for lang in required_languages:
+        check_traineddata(tessdata_dir / f"{lang}.traineddata")
+
+    # IMPORTANT: list args are used instead of a quoted config string.
+    # This avoids the Windows path bug: "C:\\...\\tessdata"/kor.traineddata.
+    result = subprocess.run(
+        [str(executable), "--tessdata-dir", str(tessdata_dir), "--list-langs"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        **win_subprocess_options(),
+    )
+    if result.returncode not in (0, 1):
+        raise RuntimeError(f"Tesseract 언어 확인 실패:\n{result.stdout.strip()}")
+
+    languages = frozenset(
+        line.strip() for line in result.stdout.splitlines()
+        if line.strip() and not line.lower().startswith("list of available languages")
+    )
+    missing = [lang for lang in required_languages if lang not in languages]
+    if missing:
         raise RuntimeError(
-            "Tesseract OCR을 찾을 수 없습니다.\n\n"
-            "run.bat을 실행하면 Tesseract 자동 설치를 시도합니다.\n"
-            r"기본 검색 경로: C:\Program Files\Tesseract-OCR\tesseract.exe"
+            "Tesseract가 언어를 로드하지 못했습니다: " + ", ".join(missing)
+            + f"\nTesseract: {executable}\ntessdata: {tessdata_dir}"
+            + f"\n감지 언어: {', '.join(sorted(languages)) or '(없음)'}"
         )
+    print(f"[OK] Tesseract: {executable}")
+    print(f"[OK] tessdata: {tessdata_dir}")
+    return TesseractRuntime(executable, tessdata_dir, languages)
 
-    pytesseract.pytesseract.tesseract_cmd = executable
 
-    # run.bat downloads kor/eng language packs here.
-    # Do NOT put quotes inside TESSDATA_PREFIX. On Windows those quotes become
-    # part of the actual path and Tesseract then tries to open
-    #   "C:\...\tessdata"/kor.traineddata
-    # which fails.
-    local_tessdata = (app_dir() / "tessdata").resolve()
-    if local_tessdata.is_dir():
-        os.environ["TESSDATA_PREFIX"] = str(local_tessdata)
-        print(f"TESSDATA_PREFIX={local_tessdata}")
+def run_ocr(image: Image.Image, runtime: TesseractRuntime, language: str, psm: int) -> str:
+    fd, temp_name = tempfile.mkstemp(prefix="ocr_capture_", suffix=".png")
+    os.close(fd)
+    temp_path = Path(temp_name)
+    try:
+        image.save(temp_path, "PNG")
+        cmd = [
+            str(runtime.executable), str(temp_path), "stdout",
+            "-l", language, "--oem", "1", "--psm", str(psm),
+            "--tessdata-dir", str(runtime.tessdata_dir),
+        ]
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            **win_subprocess_options(),
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Tesseract exit code {result.returncode}\n"
+                f"Tesseract: {runtime.executable}\n"
+                f"tessdata: {runtime.tessdata_dir}\n\n"
+                f"{result.stderr.strip() or result.stdout.strip()}"
+            )
+        return result.stdout
+    finally:
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def get_foreground_window() -> Optional[int]:
@@ -137,33 +208,25 @@ def restore_foreground_window(hwnd: Optional[int]) -> None:
 
 
 def clean_ocr_text(text: str) -> str:
-    lines = [line.rstrip() for line in text.replace("\r\n", "\n").split("\n")]
-    result: list[str] = []
-    previous_empty = False
-    for line in lines:
+    result, previous_empty = [], False
+    for line in text.replace("\r\n", "\n").split("\n"):
+        line = line.rstrip()
         empty = not line.strip()
-        if empty and previous_empty:
-            continue
-        result.append(line)
+        if not (empty and previous_empty):
+            result.append(line)
         previous_empty = empty
     return "\n".join(result).strip()
 
 
 def preprocess_image(image: Image.Image, config: dict) -> Image.Image:
-    processed = image.convert("L") if config.get("grayscale", True) else image
+    out = image.convert("L") if config.get("grayscale", True) else image
     scale = float(config.get("ocr_scale", 2.0))
     if scale > 1.0:
-        width, height = processed.size
-        processed = processed.resize(
-            (max(1, int(width * scale)), max(1, int(height * scale))),
-            Image.Resampling.LANCZOS,
-        )
+        out = out.resize((int(out.width * scale), int(out.height * scale)), Image.Resampling.LANCZOS)
     contrast = float(config.get("contrast", 1.0))
     if contrast != 1.0:
-        processed = ImageEnhance.Contrast(processed).enhance(contrast)
-    if config.get("sharpen", True):
-        processed = processed.filter(ImageFilter.SHARPEN)
-    return processed
+        out = ImageEnhance.Contrast(out).enhance(contrast)
+    return out.filter(ImageFilter.SHARPEN) if config.get("sharpen", True) else out
 
 
 @dataclass
@@ -179,90 +242,51 @@ def capture_virtual_screen() -> VirtualScreenCapture:
     with mss.mss() as sct:
         monitor = sct.monitors[0]
         shot = sct.grab(monitor)
-        image = Image.frombytes("RGB", shot.size, bytes(shot.rgb))
         return VirtualScreenCapture(
-            image=image,
-            left=int(monitor["left"]),
-            top=int(monitor["top"]),
-            width=int(monitor["width"]),
-            height=int(monitor["height"]),
+            Image.frombytes("RGB", shot.size, bytes(shot.rgb)),
+            int(monitor["left"]), int(monitor["top"]),
+            int(monitor["width"]), int(monitor["height"]),
         )
 
 
 class SelectionOverlay:
     def __init__(self, root, capture, on_selected, on_cancelled) -> None:
-        self.capture = capture
-        self.on_selected = on_selected
-        self.on_cancelled = on_cancelled
-        self.start_x = None
-        self.start_y = None
-        self.rect_id = None
-
+        self.capture, self.on_selected, self.on_cancelled = capture, on_selected, on_cancelled
+        self.start_x = self.start_y = self.rect_id = None
         self.window = tk.Toplevel(root)
         self.window.overrideredirect(True)
         self.window.attributes("-topmost", True)
-        self.window.geometry(
-            f"{capture.width}x{capture.height}{capture.left:+d}{capture.top:+d}"
-        )
-
-        self.canvas = tk.Canvas(
-            self.window,
-            width=capture.width,
-            height=capture.height,
-            highlightthickness=0,
-            cursor="crosshair",
-        )
+        self.window.geometry(f"{capture.width}x{capture.height}{capture.left:+d}{capture.top:+d}")
+        self.canvas = tk.Canvas(self.window, highlightthickness=0, cursor="crosshair")
         self.canvas.pack(fill=tk.BOTH, expand=True)
         self.photo = ImageTk.PhotoImage(capture.image)
         self.canvas.create_image(0, 0, anchor=tk.NW, image=self.photo)
         self.canvas.create_rectangle(14, 14, 405, 54, fill="black", outline="")
-        self.canvas.create_text(
-            28,
-            34,
-            anchor=tk.W,
-            fill="white",
-            text="OCR 영역을 드래그하세요  |  ESC: 취소",
-            font=("Malgun Gothic", 12, "bold"),
-        )
-        self.canvas.bind("<ButtonPress-1>", self._mouse_down)
-        self.canvas.bind("<B1-Motion>", self._mouse_move)
-        self.canvas.bind("<ButtonRelease-1>", self._mouse_up)
+        self.canvas.create_text(28, 34, anchor=tk.W, fill="white", text="OCR 영역을 드래그하세요  |  ESC: 취소", font=("Malgun Gothic", 12, "bold"))
+        self.canvas.bind("<ButtonPress-1>", self._down)
+        self.canvas.bind("<B1-Motion>", self._move)
+        self.canvas.bind("<ButtonRelease-1>", self._up)
         self.window.bind("<Escape>", self._cancel)
         self.window.focus_force()
 
-    def _mouse_down(self, event) -> None:
-        self.start_x = max(0, min(int(event.x), self.capture.width))
-        self.start_y = max(0, min(int(event.y), self.capture.height))
+    def _down(self, event) -> None:
+        self.start_x, self.start_y = int(event.x), int(event.y)
         if self.rect_id is not None:
             self.canvas.delete(self.rect_id)
-        self.rect_id = self.canvas.create_rectangle(
-            self.start_x,
-            self.start_y,
-            self.start_x,
-            self.start_y,
-            outline="#ff3b30",
-            width=3,
-        )
+        self.rect_id = self.canvas.create_rectangle(self.start_x, self.start_y, self.start_x, self.start_y, outline="#ff3b30", width=3)
 
-    def _mouse_move(self, event) -> None:
-        if self.start_x is None or self.start_y is None or self.rect_id is None:
-            return
-        x = max(0, min(int(event.x), self.capture.width))
-        y = max(0, min(int(event.y), self.capture.height))
-        self.canvas.coords(self.rect_id, self.start_x, self.start_y, x, y)
+    def _move(self, event) -> None:
+        if self.rect_id is not None:
+            self.canvas.coords(self.rect_id, self.start_x, self.start_y, event.x, event.y)
 
-    def _mouse_up(self, event) -> None:
-        if self.start_x is None or self.start_y is None:
-            return
-        end_x = max(0, min(int(event.x), self.capture.width))
-        end_y = max(0, min(int(event.y), self.capture.height))
-        x1, x2 = sorted((self.start_x, end_x))
-        y1, y2 = sorted((self.start_y, end_y))
+    def _up(self, event) -> None:
+        x1, x2 = sorted((max(0, self.start_x), min(self.capture.width, int(event.x))))
+        y1, y2 = sorted((max(0, self.start_y), min(self.capture.height, int(event.y))))
         self.window.destroy()
-        if (x2 - x1) < 8 or (y2 - y1) < 8:
+        if x2 - x1 < 8 or y2 - y1 < 8:
             self.on_cancelled()
-            return
-        self.on_selected(self.capture.image.crop((x1, y1, x2, y2)))
+        else:
+            self.on_selected(self.capture.image.crop((x1, y1, x2, y2)))
 
     def _cancel(self, _event=None) -> None:
         self.window.destroy()
@@ -271,108 +295,61 @@ class SelectionOverlay:
 
 class OCRCaptureApp:
     def __init__(self, root: tk.Tk) -> None:
-        self.root = root
-        self.config = load_config()
-        self.queue: queue.Queue = queue.Queue()
-        self.controller = keyboard.Controller()
-        self.hotkeys = None
-        self.busy = False
-        self.target_hwnd: Optional[int] = None
+        self.root, self.config = root, load_config()
+        self.queue, self.controller = queue.Queue(), keyboard.Controller()
+        self.hotkeys, self.busy, self.target_hwnd = None, False, None
         self.root.withdraw()
-
+        langs = [x for x in str(self.config.get("language", "kor+eng")).split("+") if x]
         try:
-            configure_tesseract()
-            languages = set(pytesseract.get_languages(config=""))
+            self.runtime = configure_tesseract(langs)
         except Exception as exc:
             messagebox.showerror(APP_NAME, f"Tesseract 설정에 실패했습니다.\n\n{exc}")
             raise SystemExit(1)
-
-        requested = str(self.config.get("language", "kor+eng")).split("+")
-        missing = [lang for lang in requested if lang and lang not in languages]
-        if missing:
-            messagebox.showerror(
-                APP_NAME,
-                "OCR 언어 데이터가 없습니다: "
-                + ", ".join(missing)
-                + "\n\nrun.bat을 다시 실행해 주세요.",
-            )
-            raise SystemExit(1)
-
         self._start_hotkeys()
-        self.root.after(40, self._poll_queue)
-        print(f"{APP_NAME} 실행 중")
-        print(f"OCR 캡처: {self.config['hotkey']}")
-        print(f"종료: {self.config['quit_hotkey']}")
+        self.root.after(40, self._poll)
+        print(f"{APP_NAME} 실행 중 / OCR: {self.config['hotkey']} / 종료: {self.config['quit_hotkey']}")
 
     def _start_hotkeys(self) -> None:
-        hotkey = str(self.config.get("hotkey", "<ctrl>+<shift>+o"))
-        quit_hotkey = str(self.config.get("quit_hotkey", "<ctrl>+<shift>+q"))
-        self.hotkeys = keyboard.GlobalHotKeys(
-            {
-                hotkey: lambda: self.queue.put(("capture", None)),
-                quit_hotkey: lambda: self.queue.put(("quit", None)),
-            }
-        )
+        self.hotkeys = keyboard.GlobalHotKeys({
+            str(self.config.get("hotkey")): lambda: self.queue.put(("capture", None)),
+            str(self.config.get("quit_hotkey")): lambda: self.queue.put(("quit", None)),
+        })
         self.hotkeys.start()
 
-    def _poll_queue(self) -> None:
+    def _poll(self) -> None:
         try:
             while True:
                 command, payload = self.queue.get_nowait()
-                if command == "capture":
-                    self._begin_capture()
-                elif command == "quit":
-                    self._quit()
-                    return
-                elif command == "ocr_done":
-                    text, hwnd = payload
-                    self._finish_ocr(text, hwnd)
-                elif command == "ocr_error":
-                    self.busy = False
-                    messagebox.showerror(APP_NAME, payload)
+                if command == "capture": self._begin_capture()
+                elif command == "quit": self._quit(); return
+                elif command == "ocr_done": self._finish_ocr(*payload)
+                elif command == "ocr_error": self.busy = False; messagebox.showerror(APP_NAME, payload)
         except queue.Empty:
             pass
-        self.root.after(40, self._poll_queue)
+        self.root.after(40, self._poll)
 
     def _begin_capture(self) -> None:
-        if self.busy:
-            return
-        self.busy = True
-        self.target_hwnd = get_foreground_window()
+        if self.busy: return
+        self.busy, self.target_hwnd = True, get_foreground_window()
         try:
             capture = capture_virtual_screen()
         except Exception as exc:
             self.busy = False
             messagebox.showerror(APP_NAME, f"화면 캡처에 실패했습니다.\n\n{exc}")
             return
-        SelectionOverlay(
-            self.root,
-            capture,
-            on_selected=self._start_ocr,
-            on_cancelled=self._capture_cancelled,
-        )
+        SelectionOverlay(self.root, capture, self._start_ocr, self._cancel_capture)
 
-    def _capture_cancelled(self) -> None:
+    def _cancel_capture(self) -> None:
         self.busy = False
         restore_foreground_window(self.target_hwnd)
 
     def _start_ocr(self, image: Image.Image) -> None:
-        threading.Thread(
-            target=self._ocr_worker,
-            args=(image, self.target_hwnd),
-            daemon=True,
-        ).start()
+        threading.Thread(target=self._ocr_worker, args=(image, self.target_hwnd), daemon=True).start()
 
     def _ocr_worker(self, image: Image.Image, hwnd: Optional[int]) -> None:
         try:
             processed = preprocess_image(image, self.config)
-            language = str(self.config.get("language", "kor+eng"))
-            psm = int(self.config.get("psm", 6))
-            text = pytesseract.image_to_string(
-                processed,
-                lang=language,
-                config=f"--oem 1 --psm {psm}",
-            )
+            text = run_ocr(processed, self.runtime, str(self.config.get("language", "kor+eng")), int(self.config.get("psm", 6)))
             self.queue.put(("ocr_done", (clean_ocr_text(text), hwnd)))
         except Exception as exc:
             self.queue.put(("ocr_error", f"OCR 처리에 실패했습니다.\n\n{exc}"))
@@ -383,49 +360,47 @@ class OCRCaptureApp:
                 messagebox.showinfo(APP_NAME, "인식된 텍스트가 없습니다.")
                 return
             pyperclip.copy(text)
-            print("\n--- OCR RESULT ---")
-            print(text)
-            print("------------------")
+            print("\n--- OCR RESULT ---\n" + text + "\n------------------")
             if self.config.get("auto_paste", True):
                 restore_foreground_window(hwnd)
-                delay_ms = max(0, int(self.config.get("paste_delay_ms", 250)))
-                self.root.after(delay_ms, self._send_paste)
+                self.root.after(max(0, int(self.config.get("paste_delay_ms", 250))), self._paste)
         finally:
             self.busy = False
 
-    def _send_paste(self) -> None:
+    def _paste(self) -> None:
         try:
             with self.controller.pressed(keyboard.Key.ctrl):
-                self.controller.press("v")
-                self.controller.release("v")
+                self.controller.press("v"); self.controller.release("v")
         except Exception as exc:
-            messagebox.showwarning(
-                APP_NAME,
-                "클립보드 복사는 완료됐지만 자동 붙여넣기에 실패했습니다.\n\n"
-                + str(exc),
-            )
+            messagebox.showwarning(APP_NAME, f"복사는 됐지만 자동 붙여넣기에 실패했습니다.\n\n{exc}")
 
     def _quit(self) -> None:
-        try:
-            if self.hotkeys:
-                self.hotkeys.stop()
-        finally:
-            self.root.quit()
-            self.root.destroy()
+        if self.hotkeys: self.hotkeys.stop()
+        self.root.quit(); self.root.destroy()
+
+
+def run_self_check() -> int:
+    config = load_config()
+    langs = [x for x in str(config.get("language", "kor+eng")).split("+") if x]
+    try:
+        runtime = configure_tesseract(langs)
+    except Exception as exc:
+        print(f"[SELF-CHECK] FAILED\n{exc}")
+        return 1
+    print(f"[SELF-CHECK] OK\nTesseract: {runtime.executable}\ntessdata: {runtime.tessdata_dir}")
+    return 0
 
 
 def main() -> None:
+    if "--check" in sys.argv:
+        raise SystemExit(run_self_check())
     set_windows_dpi_awareness()
-    root = tk.Tk()
-    root.title(APP_NAME)
+    root = tk.Tk(); root.title(APP_NAME)
     try:
-        OCRCaptureApp(root)
-        root.mainloop()
+        OCRCaptureApp(root); root.mainloop()
     except SystemExit:
-        try:
-            root.destroy()
-        except Exception:
-            pass
+        try: root.destroy()
+        except Exception: pass
         raise
 
 
