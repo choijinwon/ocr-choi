@@ -1,6 +1,5 @@
 mss>=10.0
 Pillow>=10.0
-pytesseract>=0.3.13
 pyperclip>=1.9
 pynput>=1.7
 pyinstaller>=6.0
