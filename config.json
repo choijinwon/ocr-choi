@@ -1,0 +1,12 @@
+{
+  "hotkey": "<ctrl>+<shift>+o",
+  "quit_hotkey": "<ctrl>+<shift>+q",
+  "language": "kor+eng",
+  "psm": 6,
+  "ocr_scale": 2.0,
+  "auto_paste": true,
+  "paste_delay_ms": 250,
+  "grayscale": true,
+  "contrast": 1.4,
+  "sharpen": true
+}
